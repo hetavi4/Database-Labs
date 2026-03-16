@@ -147,10 +147,10 @@ public class BufferPool {
      * Does NOT remove pages from the buffer pool.
      */
     public synchronized void flushAllPages() throws IOException {
-        for (PageId pid : pageMap.keySet()) {
-            flushPage(pid);
-        }
+    for (PageId pid : new java.util.ArrayList<>(pageMap.keySet())) {
+        flushPage(pid);
     }
+}
 
     /** Remove the specific page id from the buffer pool without flushing. */
     public synchronized void discardPage(PageId pid) {
