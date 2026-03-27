@@ -123,20 +123,28 @@ public class HeapFile implements DbFile {
     public List<Page> insertTuple(TransactionId tid, Tuple t)
             throws DbException, IOException, TransactionAbortedException {
         List<Page> dirtyPages = new ArrayList<>();
-        // Try existing pages for a free slot
+        // Scan existing pages with READ_ONLY; release lock immediately if page is full
         for (int i = 0; i < numPages(); i++) {
             HeapPageId pid = new HeapPageId(getId(), i);
-            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
-            if (page.getNumEmptySlots() > 0) {
-                page.insertTuple(t);
-                page.markDirty(true, tid);
-                dirtyPages.add(page);
-                return dirtyPages;
+            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_ONLY);
+            if (page.getNumEmptySlots() == 0) {
+                Database.getBufferPool().unsafeReleasePage(tid, pid);
+                continue;
             }
+            // Found a free slot — upgrade to READ_WRITE and insert
+            page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+            page.insertTuple(t);
+            page.markDirty(true, tid);
+            dirtyPages.add(page);
+            return dirtyPages;
         }
-        // No space — append a new empty page to disk, then load via BufferPool
-        HeapPageId newPid = new HeapPageId(getId(), numPages());
-        writePage(new HeapPage(newPid, HeapPage.createEmptyPageData()));
+        // No space — atomically determine new page number and write to disk,
+        // preventing two concurrent transactions from writing to the same offset
+        HeapPageId newPid;
+        synchronized (this) {
+            newPid = new HeapPageId(getId(), numPages());
+            writePage(new HeapPage(newPid, HeapPage.createEmptyPageData()));
+        }
         HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, newPid, Permissions.READ_WRITE);
         page.insertTuple(t);
         page.markDirty(true, tid);
