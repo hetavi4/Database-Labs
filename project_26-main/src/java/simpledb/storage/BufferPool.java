@@ -16,37 +16,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * BufferPool manages the reading and writing of pages into memory from
- * disk. Access methods call into it to retrieve pages, and it fetches
- * pages from the appropriate location.
- * <p>
- * The BufferPool is also responsible for locking;  when a transaction fetches
- * a page, BufferPool checks that the transaction has the appropriate
- * locks to read/write the page.
- *
- * @Threadsafe, all fields are final
- */
 public class BufferPool {
 
     private final int numPages;
-    // LinkedHashMap with access order = true gives us LRU ordering
     private final LinkedHashMap<PageId, Page> pageMap;
     private final LockManager lockManager;
 
     private static final int DEFAULT_PAGE_SIZE = 4096;
     private static int pageSize = DEFAULT_PAGE_SIZE;
 
-    /** Default number of pages passed to the constructor. This is used by
-    other classes. BufferPool should use the numPages argument to the
-    constructor instead. */
     public static final int DEFAULT_PAGES = 50;
 
-    /**
-     * Creates a BufferPool that caches up to numPages pages.
-     *
-     * @param numPages maximum number of pages in this buffer pool.
-     */
     public BufferPool(int numPages) {
         this.numPages = numPages;
         this.pageMap = new LinkedHashMap<>(numPages, 0.75f, true);
@@ -57,25 +37,17 @@ public class BufferPool {
         return pageSize;
     }
 
-    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
     public static void setPageSize(int pageSize) {
         BufferPool.pageSize = pageSize;
     }
 
-    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
     public static void resetPageSize() {
         BufferPool.pageSize = DEFAULT_PAGE_SIZE;
     }
 
-    /**
-     * Retrieve the specified page with the associated permissions.
-     * Will acquire a lock and may block if that lock is held by another
-     * transaction.
-     */
     public Page getPage(TransactionId tid, PageId pid, Permissions perm)
             throws TransactionAbortedException, DbException {
 
-        // Acquire the lock first — may block until granted (uses LockManager's own monitor)
         lockManager.acquireLock(tid, pid, perm);
 
         synchronized (this) {
@@ -92,36 +64,55 @@ public class BufferPool {
         }
     }
 
-    /**
-     * Releases the lock on a page.
-     */
     public void unsafeReleasePage(TransactionId tid, PageId pid) {
         lockManager.releaseLock(tid, pid);
     }
 
     /**
-     * Release all locks associated with a given transaction.
+     * Exercise 4: commit always calls transactionComplete(tid, true)
      */
     public void transactionComplete(TransactionId tid) {
-        // not necessary for lab1|lab2
+        try {
+            transactionComplete(tid, true);
+        } catch (Exception e) {
+            // ignore
+        }
     }
 
-    /** Return true if the specified transaction has a lock on the specified page */
     public boolean holdsLock(TransactionId tid, PageId p) {
         return lockManager.holdsLock(tid, p);
     }
 
     /**
-     * Commit or abort a given transaction; release all locks associated to
-     * the transaction.
+     * Exercise 4: commit or abort a transaction.
+     * - commit: flush all dirty pages belonging to this transaction to disk (FORCE)
+     * - abort:  discard dirty pages belonging to this transaction (NO STEAL — reload from disk)
+     * Either way: release all locks held by this transaction.
      */
     public void transactionComplete(TransactionId tid, boolean commit) {
-        // not necessary for lab1|lab2
+        synchronized (this) {
+            for (PageId pid : new java.util.ArrayList<>(pageMap.keySet())) {
+                Page page = pageMap.get(pid);
+                if (page == null) continue;
+                if (tid.equals(page.isDirty())) {
+                    if (commit) {
+                        // FORCE: write dirty pages to disk on commit
+                        try {
+                            flushPage(pid);
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    } else {
+                        // ABORT: discard dirty page — it will be reloaded from disk on next access
+                        pageMap.remove(pid);
+                    }
+                }
+            }
+        }
+        // Release all locks held by this transaction
+        lockManager.releaseAllLocks(tid);
     }
 
-    /**
-     * Add a tuple to the specified table on behalf of transaction tid.
-     */
     public void insertTuple(TransactionId tid, int tableId, Tuple t)
             throws DbException, IOException, TransactionAbortedException {
         DbFile file = Database.getCatalog().getDatabaseFile(tableId);
@@ -134,9 +125,6 @@ public class BufferPool {
         }
     }
 
-    /**
-     * Remove the specified tuple from the buffer pool.
-     */
     public void deleteTuple(TransactionId tid, Tuple t)
             throws DbException, IOException, TransactionAbortedException {
         int tableId = t.getRecordId().getPageId().getTableId();
@@ -150,25 +138,16 @@ public class BufferPool {
         }
     }
 
-    /**
-     * Flush all dirty pages to disk.
-     * Does NOT remove pages from the buffer pool.
-     */
     public synchronized void flushAllPages() throws IOException {
-    for (PageId pid : new java.util.ArrayList<>(pageMap.keySet())) {
-        flushPage(pid);
+        for (PageId pid : new java.util.ArrayList<>(pageMap.keySet())) {
+            flushPage(pid);
+        }
     }
-}
 
-    /** Remove the specific page id from the buffer pool without flushing. */
     public synchronized void discardPage(PageId pid) {
         pageMap.remove(pid);
     }
 
-    /**
-     * Flushes a dirty page to disk and marks it as not dirty.
-     * Does NOT remove the page from the buffer pool.
-     */
     private synchronized void flushPage(PageId pid) throws IOException {
         Page page = pageMap.get(pid);
         if (page == null) return;
@@ -179,24 +158,40 @@ public class BufferPool {
         }
     }
 
-    /** Write all pages of the specified transaction to disk. */
     public synchronized void flushPages(TransactionId tid) throws IOException {
-        // not necessary for lab1|lab2
+        for (PageId pid : new java.util.ArrayList<>(pageMap.keySet())) {
+            Page page = pageMap.get(pid);
+            if (page != null && tid.equals(page.isDirty())) {
+                flushPage(pid);
+            }
+        }
     }
 
     /**
-     * Tracks shared and exclusive page-level locks per transaction.
-     * All methods are synchronized on the LockManager instance, so it is safe
-     * to call acquireLock() from outside any BufferPool synchronized block
-     * (avoiding a deadlock where a thread holds the BufferPool monitor while
-     * waiting for a lock that another thread cannot release because it too is
-     * blocked on the BufferPool monitor).
+     * Exercise 3: NO STEAL eviction policy.
+     * Never evict a dirty page. Only evict clean pages.
+     * If all pages are dirty, throw DbException.
      */
+    private synchronized void evictPage() throws DbException {
+        for (Map.Entry<PageId, Page> entry : new java.util.ArrayList<>(pageMap.entrySet())) {
+            PageId pid = entry.getKey();
+            Page page = entry.getValue();
+            // NO STEAL: skip dirty pages
+            if (page.isDirty() != null) {
+                continue;
+            }
+            // Found a clean page — evict it
+            pageMap.remove(pid);
+            return;
+        }
+        throw new DbException("All pages in buffer pool are dirty — cannot evict (NO STEAL policy)");
+    }
+
     private class LockManager {
-        // pageId -> set of transactions holding a shared lock
         private final Map<PageId, Set<TransactionId>> sharedLocks = new HashMap<>();
-        // pageId -> transaction holding the exclusive lock (at most one)
         private final Map<PageId, TransactionId> exclusiveLocks = new HashMap<>();
+        // track all pages locked by each transaction (for releaseAllLocks)
+        private final Map<TransactionId, Set<PageId>> transactionPages = new HashMap<>();
 
         public synchronized void acquireLock(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException {
@@ -205,13 +200,14 @@ public class BufferPool {
             } else {
                 acquireExclusiveLock(tid, pid);
             }
+            // Track which pages this transaction holds locks on
+            transactionPages.computeIfAbsent(tid, k -> new HashSet<>()).add(pid);
         }
 
         private void acquireSharedLock(TransactionId tid, PageId pid)
                 throws TransactionAbortedException {
             while (true) {
                 TransactionId excHolder = exclusiveLocks.get(pid);
-                // Grant if nobody holds exclusive, or WE hold exclusive (already have stronger lock)
                 if (excHolder == null || excHolder.equals(tid)) {
                     sharedLocks.computeIfAbsent(pid, k -> new HashSet<>()).add(tid);
                     return;
@@ -224,12 +220,10 @@ public class BufferPool {
                 throws TransactionAbortedException {
             while (true) {
                 TransactionId excHolder = exclusiveLocks.get(pid);
-                // Already hold exclusive — nothing to do
                 if (tid.equals(excHolder)) return;
 
                 Set<TransactionId> shared = sharedLocks.getOrDefault(pid, Collections.emptySet());
                 boolean noExclusive = (excHolder == null);
-                // Can grant if no other transaction holds shared (upgrade ok if only we hold shared)
                 boolean noOtherShared = shared.isEmpty() || (shared.size() == 1 && shared.contains(tid));
 
                 if (noExclusive && noOtherShared) {
@@ -249,6 +243,27 @@ public class BufferPool {
                 shared.remove(tid);
                 if (shared.isEmpty()) sharedLocks.remove(pid);
             }
+            Set<PageId> pages = transactionPages.get(tid);
+            if (pages != null) pages.remove(pid);
+            notifyAll();
+        }
+
+        /**
+         * Release ALL locks held by a transaction (called on commit/abort).
+         */
+        public synchronized void releaseAllLocks(TransactionId tid) {
+            Set<PageId> pages = transactionPages.remove(tid);
+            if (pages == null) return;
+            for (PageId pid : pages) {
+                if (tid.equals(exclusiveLocks.get(pid))) {
+                    exclusiveLocks.remove(pid);
+                }
+                Set<TransactionId> shared = sharedLocks.get(pid);
+                if (shared != null) {
+                    shared.remove(tid);
+                    if (shared.isEmpty()) sharedLocks.remove(pid);
+                }
+            }
             notifyAll();
         }
 
@@ -258,24 +273,4 @@ public class BufferPool {
             return shared != null && shared.contains(tid);
         }
     }
-
-    /**
-     * Evicts the least recently used page from the buffer pool using LRU policy.
-     * Flushes the page first if it is dirty.
-     */
-    private synchronized void evictPage() throws DbException {
-        // Iterate in LRU order (first entry = least recently used)
-        for (Map.Entry<PageId, Page> entry : pageMap.entrySet()) {
-            PageId pid = entry.getKey();
-            try {
-                flushPage(pid);
-            } catch (IOException e) {
-                throw new DbException("Failed to flush page during eviction: " + e.getMessage());
-            }
-            pageMap.remove(pid);
-            return;
-        }
-        throw new DbException("Buffer pool is full and no page could be evicted");
-    }
-
 }
