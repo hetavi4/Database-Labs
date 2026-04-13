@@ -192,6 +192,8 @@ public class BufferPool {
         private final Map<PageId, TransactionId> exclusiveLocks = new HashMap<>();
         // track all pages locked by each transaction (for releaseAllLocks)
         private final Map<TransactionId, Set<PageId>> transactionPages = new HashMap<>();
+        // wait-for graph: tid -> set of tids it is waiting for
+        private final Map<TransactionId, Set<TransactionId>> waitForGraph = new HashMap<>();
 
         public synchronized void acquireLock(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException {
@@ -210,9 +212,28 @@ public class BufferPool {
                 TransactionId excHolder = exclusiveLocks.get(pid);
                 if (excHolder == null || excHolder.equals(tid)) {
                     sharedLocks.computeIfAbsent(pid, k -> new HashSet<>()).add(tid);
+                    // Remove from wait-for graph since we're no longer waiting
+                    waitForGraph.remove(tid);
                     return;
                 }
-                try { wait(); } catch (InterruptedException e) { throw new TransactionAbortedException(); }
+                // check for deadlock
+                Set<TransactionId> holders = new HashSet<>();
+                holders.add(excHolder);
+                // add edge, tid waits for excHolder
+                waitForGraph.put(tid, new HashSet<>(holders));
+
+                if (detectDeadlock(tid)) {
+                    // Remove the edge that was just added and abort
+                    waitForGraph.remove(tid);
+                    throw new TransactionAbortedException();
+                }
+
+                try { 
+                    wait(); 
+                } catch (InterruptedException e) { 
+                    waitForGraph.remove(tid);
+                    throw new TransactionAbortedException(); 
+                }
             }
         }
 
@@ -220,7 +241,10 @@ public class BufferPool {
                 throws TransactionAbortedException {
             while (true) {
                 TransactionId excHolder = exclusiveLocks.get(pid);
-                if (tid.equals(excHolder)) return;
+                if (tid.equals(excHolder)) {
+                    waitForGraph.remove(tid);
+                    return;
+                }
 
                 Set<TransactionId> shared = sharedLocks.getOrDefault(pid, Collections.emptySet());
                 boolean noExclusive = (excHolder == null);
@@ -228,10 +252,63 @@ public class BufferPool {
 
                 if (noExclusive && noOtherShared) {
                     exclusiveLocks.put(pid, tid);
+                    waitForGraph.remove(tid);
                     return;
                 }
-                try { wait(); } catch (InterruptedException e) { throw new TransactionAbortedException(); }
+
+                // We must wait — build set of holders we're waiting for
+                Set<TransactionId> holders = new HashSet<>();
+                if (excHolder != null && !excHolder.equals(tid)) {
+                    holders.add(excHolder);
+                }
+                for (TransactionId sharedTid : shared) {
+                    if (!sharedTid.equals(tid)) {
+                        holders.add(sharedTid);
+                    }
+                }
+
+                // Add edges: tid waits for all holders
+                waitForGraph.put(tid, new HashSet<>(holders));
+
+                if (detectDeadlock(tid)) {
+                    waitForGraph.remove(tid);
+                    throw new TransactionAbortedException();
+                }
+
+                try { wait(); } catch (InterruptedException e) { 
+                    waitForGraph.remove(tid);
+                    throw new TransactionAbortedException(); }
             }
+        }
+
+        /**
+         * Detect if there is a cycle in the wait-for graph starting from tid.
+         * Uses DFS. Returns true if a cycle is detected (deadlock).
+         */
+        private boolean detectDeadlock(TransactionId startTid) {
+            Set<TransactionId> visited = new HashSet<>();
+            return dfs(startTid, visited);
+        }
+
+        /**
+         * DFS traversal of wait-for graph. Returns true if we revisit startTid
+         * (i.e., find a cycle reachable from the start node).
+         */
+        private boolean dfs(TransactionId current, Set<TransactionId> visited) {
+            if (visited.contains(current)) {
+                return true; // cycle detected
+            }
+            visited.add(current);
+            Set<TransactionId> waitingFor = waitForGraph.get(current);
+            if (waitingFor != null) {
+                for (TransactionId next : waitingFor) {
+                    if (dfs(next, visited)) {
+                        return true;
+                    }
+                }
+            }
+            visited.remove(current);
+            return false;
         }
 
         public synchronized void releaseLock(TransactionId tid, PageId pid) {
@@ -264,6 +341,7 @@ public class BufferPool {
                     if (shared.isEmpty()) sharedLocks.remove(pid);
                 }
             }
+            waitForGraph.remove(tid);
             notifyAll();
         }
 
